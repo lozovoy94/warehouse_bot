@@ -5,7 +5,7 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 
-from utils.texts import (
+from ..utils.texts import (
     BTN_START_SHIFT,
     BTN_END_SHIFT,
     BTN_FBS,
