@@ -30,7 +30,6 @@ from .keyboards import (
     main_menu_keyboard,
     operation_control_keyboard,
     other_tasks_keyboard,
-    packing_types_keyboard,
 )
 
 logger = logging.getLogger(__name__)
@@ -411,7 +410,7 @@ async def my_report_today(message: Message) -> None:
 @router.message(Command("admin_summary"))
 async def admin_summary(message: Message) -> None:
     """
-    /admin_summary         -> по сегодняшнему дню
+    /admin_summary            -> по сегодняшнему дню
     /admin_summary 01.12.2025 -> по указанной дате
     """
     assert sheets_client is not None
