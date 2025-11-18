@@ -82,11 +82,28 @@ def main() -> None:
     setup_logging()
     config = load_config()
 
-    # Инициализация Google Sheets клиента и структуры
-    init_sheets_client(config)
-    assert sheets_client is not None
-    sheets_client.ensure_structure()
+    # --- Инициализация Google Sheets клиента ---
+    try:
+        init_sheets_client(config)
+    except Exception:
+        logger.exception(
+            "Failed to initialize Google Sheets client. "
+            "Проверь GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_SHEET_ID и доступы сервисного аккаунта."
+        )
+        # выбрасываем дальше, чтобы Railway показал стек
+        raise
 
+    # Подтягиваем глобальный объект после init
+    from .sheets import sheets_client as _sc
+
+    if _sc is None:
+        logger.error("Sheets client глобально не инициализировался.")
+        raise RuntimeError("Sheets client is None after init_sheets_client")
+
+    # Создаём/проверяем структуру таблиц
+    _sc.ensure_structure()
+
+    # --- Запуск бота ---
     if config.environment == "local":
         asyncio.run(run_polling(config))
     else:
