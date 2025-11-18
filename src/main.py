@@ -3,6 +3,7 @@ import logging
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Update
 
@@ -17,7 +18,10 @@ logger = logging.getLogger(__name__)
 
 async def run_polling(config: Config) -> None:
     """Локальный режим: polling."""
-    bot = Bot(token=config.telegram_bot_token, parse_mode="HTML")
+    bot = Bot(
+        token=config.telegram_bot_token,
+        default=DefaultBotProperties(parse_mode="HTML"),
+    )
     dp = Dispatcher(storage=MemoryStorage())
     register_handlers(dp, config)
 
@@ -30,7 +34,10 @@ def create_web_app(config: Config) -> web.Application:
     app = web.Application()
     app["config"] = config
 
-    bot = Bot(token=config.telegram_bot_token, parse_mode="HTML")
+    bot = Bot(
+        token=config.telegram_bot_token,
+        default=DefaultBotProperties(parse_mode="HTML"),
+    )
     dp = Dispatcher(storage=MemoryStorage())
     register_handlers(dp, config)
 
