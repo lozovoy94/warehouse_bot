@@ -5,8 +5,8 @@ from datetime import datetime, date
 import gspread
 from google.oauth2.service_account import Credentials
 
-from utils.datetime_utils import format_date_dmy, parse_time_hm, format_time_hm
-from models.entities import Employee, Shift
+from ..utils.datetime_utils import format_date_dmy, parse_time_hm, format_time_hm
+from ..models.entities import Employee, Shift
 
 logger = logging.getLogger(__name__)
 
