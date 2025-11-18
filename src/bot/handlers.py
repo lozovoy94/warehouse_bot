@@ -7,7 +7,7 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 
 from ..config import Config
-from ..sheets import sheets_client
+from ..sheets.client import sheets_client
 from ..models.entities import Employee
 from ..utils.datetime_utils import get_now_local, format_date_dmy, format_minutes_human
 from ..utils.texts import (
