@@ -8,7 +8,7 @@ from aiogram.types import Update
 
 from .config import load_config, Config
 from .logging_config import setup_logging
-from .sheets import init_sheets_client, sheets_client
+from .sheets import init_sheets_client
 from .bot import register_handlers
 
 
@@ -84,24 +84,20 @@ def main() -> None:
 
     # --- Инициализация Google Sheets клиента ---
     try:
-        init_sheets_client(config)
+        sc = init_sheets_client(config)
     except Exception:
         logger.exception(
             "Failed to initialize Google Sheets client. "
             "Проверь GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_SHEET_ID и доступы сервисного аккаунта."
         )
-        # выбрасываем дальше, чтобы Railway показал стек
         raise
 
-    # Подтягиваем глобальный объект после init
-    from .sheets import sheets_client as _sc
-
-    if _sc is None:
-        logger.error("Sheets client глобально не инициализировался.")
+    if sc is None:
+        logger.error("init_sheets_client вернул None.")
         raise RuntimeError("Sheets client is None after init_sheets_client")
 
     # Создаём/проверяем структуру таблиц
-    _sc.ensure_structure()
+    sc.ensure_structure()
 
     # --- Запуск бота ---
     if config.environment == "local":
