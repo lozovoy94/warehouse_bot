@@ -6,10 +6,10 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Update
 
-from config import load_config, Config
-from logging_config import setup_logging
-from sheets import init_sheets_client, sheets_client
-from bot import register_handlers
+from .config import load_config, Config
+from .logging_config import setup_logging
+from .sheets import init_sheets_client, sheets_client
+from .bot import register_handlers
 
 
 logger = logging.getLogger(__name__)
