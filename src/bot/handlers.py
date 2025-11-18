@@ -1,16 +1,16 @@
 import logging
-from datetime import date
+from datetime import date, datetime
 
-from aiogram import Router, F, Bot, Dispatcher
+from aiogram import Router, F, Dispatcher
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 
-from config import Config
-from sheets import sheets_client
-from models.entities import Employee
-from utils.datetime_utils import get_now_local, format_date_dmy, format_minutes_human
-from utils.texts import (
+from ..config import Config
+from ..sheets import sheets_client
+from ..models.entities import Employee
+from ..utils.datetime_utils import get_now_local, format_date_dmy, format_minutes_human
+from ..utils.texts import (
     WELCOME_TEXT,
     ASK_NAME_TEXT,
     NOT_REGISTERED_TEXT,
@@ -51,16 +51,6 @@ def register_handlers(dp: Dispatcher, config: Config) -> None:
 def _get_now():
     assert _config is not None
     return get_now_local(_config.timezone)
-
-
-def _get_employee_or_prompt_start(message: Message) -> Employee | None:
-    assert sheets_client is not None
-    emp = sheets_client.get_employee_by_telegram_id(message.from_user.id)
-    if not emp:
-        # просим зарегистрироваться
-        message.answer(NOT_REGISTERED_TEXT)
-        return None
-    return emp
 
 
 # ---------- /start и регистрация ----------
@@ -127,7 +117,7 @@ async def start_shift(message: Message) -> None:
 
     try:
         sheets_client.start_shift(emp, now)
-    except Exception as e:
+    except Exception:
         logger.exception("Error starting shift")
         await message.answer("Ошибка записи смены в таблицу. Сообщи руководителю.")
         return
@@ -146,7 +136,7 @@ async def end_shift(message: Message) -> None:
 
     try:
         ok = sheets_client.end_shift(emp.telegram_id, now)
-    except Exception as e:
+    except Exception:
         logger.exception("Error ending shift")
         await message.answer("Ошибка при завершении смены. Сообщи руководителю.")
         return
@@ -195,6 +185,21 @@ async def start_fbs_operation(message: Message, state: FSMContext) -> None:
     await message.answer("Отправь артикул товара (можно отсканировать штрихкод как текст).")
 
 
+# ---------- Упаковка ----------
+
+@router.message(F.text == BTN_PACKING)
+async def start_packing_operation(message: Message, state: FSMContext) -> None:
+    emp = await _check_can_start_operation(message, state)
+    if not emp:
+        return
+
+    await state.set_state(OperationStates.waiting_article)
+    await state.update_data(operation_type="Упаковка", employee_tg_id=emp.telegram_id)
+    await message.answer("Отправь артикул товара для упаковки.")
+
+
+# ---------- Обработка артикула (общая для FBS и Упаковки) ----------
+
 @router.message(OperationStates.waiting_article)
 async def process_article(message: Message, state: FSMContext) -> None:
     article = (message.text or "").strip()
@@ -204,8 +209,10 @@ async def process_article(message: Message, state: FSMContext) -> None:
 
     await state.update_data(article=article)
     await state.set_state(OperationStates.waiting_quantity)
-    await message.answer("Сколько штук ты собираешь по этому артикулу? Введи число.")
+    await message.answer("Сколько штук ты обрабатываешь по этому артикулу? Введи число.")
 
+
+# ---------- Обработка количества (общая) ----------
 
 @router.message(OperationStates.waiting_quantity)
 async def process_quantity(message: Message, state: FSMContext) -> None:
@@ -231,34 +238,6 @@ async def process_quantity(message: Message, state: FSMContext) -> None:
         f"Когда закончишь — нажми «✅ Закончил».",
         reply_markup=operation_control_keyboard(),
     )
-
-
-# ---------- Упаковка ----------
-
-@router.message(F.text == BTN_PACKING)
-async def start_packing_operation(message: Message, state: FSMContext) -> None:
-    emp = await _check_can_start_operation(message, state)
-    if not emp:
-        return
-
-    await state.set_state(OperationStates.waiting_article)
-    await state.update_data(operation_type="Упаковка", employee_tg_id=emp.telegram_id)
-    await message.answer("Отправь артикул товара для упаковки.")
-
-
-@router.message(OperationStates.waiting_article, F.text, F.text.as_("txt"))
-async def process_article_for_packing(message: Message, state: FSMContext, txt: str) -> None:
-    # Этот хэндлер уже есть выше, но для упаковки логика такая же
-    # поэтому мы просто переиспользуем основной process_article, чтобы не дублировать код.
-    # Для простоты оставим только один хэндлер выше. Этот можно не использовать.
-    pass  # см. основной process_article выше
-
-
-@router.message(OperationStates.waiting_quantity, F.text, F.text.as_("txt"))
-async def process_quantity_generic(message: Message, state: FSMContext, txt: str) -> None:
-    # В реальной жизни можно было бы разделить логику,
-    # но здесь уже реализован общий process_quantity выше.
-    pass  # см. process_quantity выше
 
 
 # ---------- Прочие задачи ----------
@@ -289,14 +268,6 @@ async def other_task_chosen(callback: CallbackQuery, state: FSMContext) -> None:
         f"Когда закончишь — нажми «✅ Закончил».",
         reply_markup=operation_control_keyboard(),
     )
-
-
-# ---------- Выбор типа упаковки (доп. шаг) ----------
-
-# Для простоты: упаковку делаем без отдельного выбора типа упаковки.
-# Если захочешь, можно включить отдельный шаг:
-# после количества спрашивать тип упаковки (см. packing_types_keyboard)
-# и добавлять его в extra-комментарий.
 
 
 # ---------- Завершение / отмена операции ----------
@@ -335,7 +306,6 @@ async def finish_operation(callback: CallbackQuery, state: FSMContext) -> None:
     extra = ""
     if op_type == "Прочие задачи":
         extra = other_task_type
-    # Для упаковки сюда можно было бы добавить тип упаковки.
 
     try:
         sheets_client.append_operation(
@@ -348,7 +318,7 @@ async def finish_operation(callback: CallbackQuery, state: FSMContext) -> None:
             time_end=now,
             extra=extra,
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Error appending operation")
         await callback.message.answer("Ошибка записи операции в таблицу. Сообщи руководителю.")
         await state.clear()
@@ -402,7 +372,7 @@ async def my_report_today(message: Message) -> None:
             day=now.date(),
             now_local=now,
         )
-    except Exception as e:
+    except Exception:
         logger.exception("Error building daily summary")
         await message.answer("Ошибка получения отчёта. Сообщи руководителю.")
         return
@@ -458,7 +428,7 @@ async def admin_summary(message: Message) -> None:
 
     try:
         summary = sheets_client.build_admin_summary_for_date(day)
-    except Exception as e:
+    except Exception:
         logger.exception("Error building admin summary")
         await message.answer("Ошибка при построении свода. Проверь таблицу или попробуй позже.")
         return
