@@ -1,3 +1,3 @@
-from .client import SheetsClient, sheets_client, init_sheets_client
+from .client import SheetsClient, init_sheets_client
 
-__all__ = ["SheetsClient", "sheets_client", "init_sheets_client"]
+__all__ = ["SheetsClient", "init_sheets_client"]
