@@ -37,6 +37,21 @@ def build_webhook_url(config) -> str:
     return f"https://{public_domain}/tg/webhook/{config.webhook_secret}"
 
 
+async def on_startup(app: web.Application):
+    """
+    Колбэк старта aiohttp-приложения: ставим вебхук в Telegram.
+    """
+    bot: Bot = app["bot"]
+    config = app["config"]
+
+    webhook_url = build_webhook_url(config)
+    await bot.set_webhook(
+        url=webhook_url,
+        allowed_updates=app["dispatcher"].resolve_used_update_types(),
+    )
+    logger.info("Webhook set to %s", webhook_url)
+
+
 def create_web_app(config) -> web.Application:
     # aiogram 3.7+: parse_mode задаём через DefaultBotProperties
     bot = Bot(
@@ -48,7 +63,7 @@ def create_web_app(config) -> web.Application:
     # Инициализация Google Sheets
     init_sheets_client(config)
 
-    # ✅ Передаём config, т.к. register_handlers ожидает (dp, config)
+    # Регистрируем хендлеры, передаём конфиг
     register_handlers(dp, config)
 
     app = web.Application()
@@ -63,15 +78,17 @@ def create_web_app(config) -> web.Application:
 
     app["bot"] = bot
     app["config"] = config
+    app["dispatcher"] = dp
+
+    # При старте приложения — ставим вебхук
+    app.on_startup.append(on_startup)
 
     return app
 
 
 def main():
     config = load_config()
-
     app = create_web_app(config)
-
     web.run_app(app, host="0.0.0.0", port=8080)
 
 
