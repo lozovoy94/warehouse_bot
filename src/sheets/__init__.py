@@ -1,36 +1,43 @@
+# src/sheets/__init__.py
+
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import Optional, Any
 
-from .client import SheetsClient
+from .client import (
+    SheetsClient,
+    init_sheets_client as _inner_init_sheets_client,
+)
 
-if TYPE_CHECKING:
-    # Только для type hints, чтобы не ловить циклические импорты
-    from ..config import Config
-
-# Глобальный экземпляр SheetsClient, на который ссылаются хэндлеры
+# Глобальный клиент, к которому будут обращаться хендлеры
 sheets_client: Optional[SheetsClient] = None
-
-
-def init_sheets_client(config: "Config") -> SheetsClient:
-    """
-    Инициализирует глобальный клиент Google Sheets и возвращает его.
-    Вызывается один раз из main.py при старте приложения.
-    """
-    global sheets_client
-
-    if sheets_client is None:
-        sheets_client = SheetsClient(
-            sheet_id=config.google_sheet_id,
-            service_account_info=config.google_service_account_info,
-            timezone=config.timezone,
-        )
-
-    return sheets_client
-
 
 __all__ = [
     "SheetsClient",
     "sheets_client",
     "init_sheets_client",
+    "get_sheets_client",
 ]
+
+
+def init_sheets_client(config: Any) -> SheetsClient:
+    """
+    Инициализация глобального SheetsClient на основании конфига.
+    Вызывается один раз при старте приложения (в main.py).
+    """
+    global sheets_client
+    client = _inner_init_sheets_client(config)
+    sheets_client = client
+    return client
+
+
+def get_sheets_client() -> SheetsClient:
+    """
+    Безопасно вернуть инициализированный SheetsClient.
+    Если по какой-то причине он ещё не инициализирован — кидаем RuntimeError,
+    чтобы это было видно в логах.
+    """
+    global sheets_client
+    if sheets_client is None:
+        raise RuntimeError("Sheets client accessed before initialization")
+    return sheets_client
