@@ -24,4 +24,61 @@ def build_webhook_url(config) -> str:
     - если есть railway_public_domain в конфиге — используем его;
     - иначе берём RAILWAY_PUBLIC_DOMAIN из env.
     """
-    public
+    public_domain = (
+        getattr(config, "railway_public_domain", None)
+        or os.getenv("RAILWAY_PUBLIC_DOMAIN")
+    )
+    if not public_domain:
+        raise RuntimeError(
+            "RAILWAY_PUBLIC_DOMAIN не задан. "
+            "Добавь его в Variables или выключи режим webhooks."
+        )
+
+    return f"https://{public_domain}/tg/webhook/{config.webhook_secret}"
+
+
+def create_web_app(config) -> web.Application:
+    # ✅ Исправление под aiogram 3.7:
+    # parse_mode задаём через DefaultBotProperties
+    bot = Bot(
+        token=config.telegram_bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp = Dispatcher()
+
+    # Инициализация Google Sheets (если не получится — просто залогируется ошибка)
+    init_sheets_client(config)
+
+    # Регистрируем хэндлеры
+    register_handlers(dp)
+
+    app = web.Application()
+
+    webhook_path = f"/tg/webhook/{config.webhook_secret}"
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    ).register(app, path=webhook_path)
+
+    setup_application(app, dp, bot=bot)
+
+    # Чтобы потом было удобно достать из app, если понадобится
+    app["bot"] = bot
+    app["config"] = config
+
+    return app
+
+
+def main():
+    config = load_config()
+
+    app = create_web_app(config)
+
+    # Webhook в Telegram уже должен быть установлен (он сохраняется между рестартами).
+    # Если захочешь, можем отдельно вернуть установку вебхука при старте.
+
+    web.run_app(app, host="0.0.0.0", port=8080)
+
+
+if __name__ == "__main__":
+    main()
