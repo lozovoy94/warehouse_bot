@@ -1,436 +1,355 @@
+# src/sheets/client.py
+
+from __future__ import annotations
+
+import json
 import logging
-from typing import Any, Dict, List, Optional
-from datetime import datetime, date
+import os
+from dataclasses import dataclass
+from datetime import datetime, date, time, timedelta
+from typing import Optional, List
 
 import gspread
-from google.oauth2.service_account import Credentials
+from google.oauth2 import service_account
 
-from ..utils.datetime_utils import format_date_dmy, parse_time_hm, format_time_hm
-from ..models.entities import Employee, Shift
+try:
+    import zoneinfo  # Python 3.13
+except ImportError:  # на всякий случай
+    from backports import zoneinfo  # type: ignore
 
 logger = logging.getLogger(__name__)
 
-EMPLOYEES_SHEET_TITLE = "Сотрудники"
-SHIFTS_SHEET_TITLE = "Смены"
-OPERATIONS_SHEET_TITLE = "Операции"
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
-sheets_client: "SheetsClient | None" = None  # глобальный экземпляр
+# Глобальный singleton, чтобы к нему обращаться из хендлеров
+_sheets_client: Optional["SheetsClient"] = None
+
+
+@dataclass
+class SheetsConfig:
+    service_account_json: str
+    spreadsheet_id: str
+    timezone: str = "Europe/Moscow"
+
+
+def _detect_config_from_app_config(app_config) -> SheetsConfig:
+    """
+    Пытаемся аккуратно вытащить настройки из объекта config,
+    а если чего-то не хватает — добираем из окружения.
+    """
+
+    # service account JSON
+    sa_json = None
+    for attr in (
+        "google_service_account_json",
+        "service_account_json",
+        "warehouse_service_account_json",
+        "gcp_service_account_json",
+    ):
+        if hasattr(app_config, attr):
+            sa_json = getattr(app_config, attr)
+            if sa_json:
+                break
+
+    if not sa_json:
+        sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+
+    # spreadsheet id
+    spreadsheet_id = None
+    for attr in (
+        "google_spreadsheet_id",
+        "spreadsheet_id",
+        "warehouse_spreadsheet_id",
+        "sheet_id",
+    ):
+        if hasattr(app_config, attr):
+            spreadsheet_id = getattr(app_config, attr)
+            if spreadsheet_id:
+                break
+
+    if not spreadsheet_id:
+        spreadsheet_id = os.environ.get("GOOGLE_SPREADSHEET_ID", "")
+
+    # timezone
+    tz_name = None
+    for attr in ("timezone", "tz", "time_zone"):
+        if hasattr(app_config, attr):
+            tz_name = getattr(app_config, attr)
+            if tz_name:
+                break
+
+    if not tz_name:
+        tz_name = os.environ.get("TZ", "Europe/Moscow")
+
+    return SheetsConfig(
+        service_account_json=sa_json,
+        spreadsheet_id=spreadsheet_id,
+        timezone=tz_name,
+    )
 
 
 class SheetsClient:
-    def __init__(self, sheet_id: str, service_account_info: Dict[str, Any], timezone: str) -> None:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
-        self._gc = gspread.authorize(creds)
-        self._sh = self._gc.open_by_key(sheet_id)
-        self._tz = timezone
+    """
+    Клиент для работы с Google Sheets.
 
-    # ------------- Инициализация структуры ----------
+    Сейчас реализовано:
+    - структура с листом Shifts
+    - логирование начала/конца смен
+    - сводка по сменам за сегодня
+    """
+
+    SHIFTS_SHEET_NAME = "Shifts"
+
+    # Порядок колонок в Shifts:
+    # A: Date (YYYY-MM-DD)
+    # B: User ID
+    # C: User Name
+    # D: Shift Start (HH:MM:SS)
+    # E: Shift End (HH:MM:SS)
+    # F: Total Minutes
+    # G: Comment (пока не используется)
+    SHIFTS_HEADERS: List[str] = [
+        "Date",
+        "User ID",
+        "User Name",
+        "Shift Start",
+        "Shift End",
+        "Total Minutes",
+        "Comment",
+    ]
+
+    def __init__(self, gc: gspread.Client, spreadsheet: gspread.Spreadsheet, tz_name: str):
+        self.gc = gc
+        self.spreadsheet = spreadsheet
+        self.tz_name = tz_name
+        try:
+            self.tz = zoneinfo.ZoneInfo(tz_name)
+        except Exception:
+            self.tz = zoneinfo.ZoneInfo("Europe/Moscow")
+
+    @classmethod
+    def from_app_config(cls, app_config) -> "SheetsClient":
+        cfg = _detect_config_from_app_config(app_config)
+
+        if not cfg.service_account_json:
+            raise RuntimeError("Service account JSON is empty/not configured")
+        if not cfg.spreadsheet_id:
+            raise RuntimeError("Spreadsheet ID is empty/not configured")
+
+        info = json.loads(cfg.service_account_json)
+        credentials = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=SCOPES,
+        )
+        gc = gspread.authorize(credentials)
+        spreadsheet = gc.open_by_key(cfg.spreadsheet_id)
+
+        return cls(gc=gc, spreadsheet=spreadsheet, tz_name=cfg.timezone)
+
+    # -------------------------------------------------------------------------
+    # Структура таблицы
+    # -------------------------------------------------------------------------
 
     def ensure_structure(self) -> None:
-        """Создать нужные листы и заголовки, если их нет."""
+        """
+        Проверяем, что все нужные листы существуют и имеют заголовки.
+        Сейчас нужен только лист Shifts.
+        """
         logger.info("Ensuring Google Sheets structure...")
-        self._ensure_employees_sheet()
-        self._ensure_shifts_sheet()
-        self._ensure_operations_sheet()
-        logger.info("Google Sheets structure OK")
 
-    def _get_or_create_worksheet(self, title: str) -> gspread.Worksheet:
         try:
-            ws = self._sh.worksheet(title)
+            ws = self.spreadsheet.worksheet(self.SHIFTS_SHEET_NAME)
         except gspread.WorksheetNotFound:
-            ws = self._sh.add_worksheet(title=title, rows=1000, cols=20)
-        return ws
-
-    def _ensure_employees_sheet(self) -> None:
-        ws = self._get_or_create_worksheet(EMPLOYEES_SHEET_TITLE)
-        headers = ["ID", "Telegram_ID", "Username", "Display_Name", "Дата_регистрации"]
-        existing = ws.row_values(1)
-        if existing != headers:
-            ws.update("A1:E1", [headers])
-
-    def _ensure_shifts_sheet(self) -> None:
-        ws = self._get_or_create_worksheet(SHIFTS_SHEET_TITLE)
-        headers = [
-            "Дата",
-            "Сотрудник",
-            "Telegram_ID",
-            "Время_начала",
-            "Время_окончания",
-            "Длительность_мин",
-            "Комментарий",
-        ]
-        existing = ws.row_values(1)
-        if existing != headers:
-            ws.update("A1:G1", [headers])
-
-    def _ensure_operations_sheet(self) -> None:
-        ws = self._get_or_create_worksheet(OPERATIONS_SHEET_TITLE)
-        headers = [
-            "Дата",
-            "Сотрудник",
-            "Telegram_ID",
-            "Тип_операции",
-            "Артикул",
-            "Количество",
-            "Время_начала",
-            "Время_окончания",
-            "Длительность_мин",
-            "Доп_тип_или_коммент",
-        ]
-        existing = ws.row_values(1)
-        if existing != headers:
-            ws.update("A1:J1", [headers])
-
-    # ------------- Сотрудники ----------
-
-    def get_employee_by_telegram_id(self, telegram_id: int) -> Optional[Employee]:
-        ws = self._sh.worksheet(EMPLOYEES_SHEET_TITLE)
-        records = ws.get_all_records()
-        for row in records:
-            if str(row.get("Telegram_ID")) == str(telegram_id):
-                return Employee(
-                    internal_id=int(row["ID"]),
-                    telegram_id=int(row["Telegram_ID"]),
-                    username=row.get("Username") or None,
-                    display_name=row.get("Display_Name") or "",
-                    registered_at=row.get("Дата_регистрации") or "",
-                )
-        return None
-
-    def register_employee(self, telegram_id: int, username: Optional[str], display_name: str, today: date) -> Employee:
-        ws = self._sh.worksheet(EMPLOYEES_SHEET_TITLE)
-        records = ws.get_all_records()
-        new_id = len(records) + 1
-        date_str = format_date_dmy(today)
-        row = [new_id, telegram_id, username or "", display_name, date_str]
-        ws.append_row(row, value_input_option="USER_ENTERED")
-        return Employee(
-            internal_id=new_id,
-            telegram_id=telegram_id,
-            username=username,
-            display_name=display_name,
-            registered_at=date_str,
-        )
-
-    # ------------- Смены ----------
-
-    def has_open_shift_for_today(self, telegram_id: int, today: date) -> bool:
-        return self._find_open_shift_row(telegram_id, today) is not None
-
-    def _find_open_shift_row(self, telegram_id: int, day: date) -> Optional[int]:
-        ws = self._sh.worksheet(SHIFTS_SHEET_TITLE)
-        all_values = ws.get_all_values()
-        if len(all_values) <= 1:
-            return None
-        date_str = format_date_dmy(day)
-
-        # all_values[0] - заголовки, дальше данные
-        for idx, row in enumerate(all_values[1:], start=2):  # индексы строк 2+
-            row_date = row[0] if len(row) > 0 else ""
-            row_tg = row[2] if len(row) > 2 else ""
-            end_time = row[4] if len(row) > 4 else ""
-            if row_date == date_str and str(row_tg) == str(telegram_id) and not end_time:
-                return idx
-        return None
-
-    def start_shift(self, employee: Employee, now_local: datetime) -> None:
-        ws = self._sh.worksheet(SHIFTS_SHEET_TITLE)
-        date_str = format_date_dmy(now_local.date())
-        start_time_str = format_time_hm(now_local)
-        row = [
-            date_str,
-            employee.display_name,
-            employee.telegram_id,
-            start_time_str,
-            "",
-            "",
-            "",
-        ]
-        ws.append_row(row, value_input_option="USER_ENTERED")
-
-    def end_shift(self, telegram_id: int, now_local: datetime) -> bool:
-        ws = self._sh.worksheet(SHIFTS_SHEET_TITLE)
-        row_index = self._find_open_shift_row(telegram_id, now_local.date())
-        if row_index is None:
-            return False
-
-        # Читаем строку целиком
-        row = ws.row_values(row_index)
-        start_time_str = row[3] if len(row) > 3 else ""
-        if not start_time_str:
-            # странный кейс, но считаем, что начали в это же время
-            start_time_str = format_time_hm(now_local)
-
-        start_time = datetime.combine(
-            now_local.date(),
-            parse_time_hm(start_time_str),
-            tzinfo=now_local.tzinfo,
-        )
-        end_time_str = format_time_hm(now_local)
-        duration_min = int((now_local - start_time).total_seconds() // 60)
-        if duration_min < 0:
-            duration_min = 0
-
-        ws.update(
-            f"E{row_index}:F{row_index}",
-            [[end_time_str, duration_min]],
-        )
-        return True
-
-    def get_shifts_for_employee_and_date(self, telegram_id: int, day: date) -> List[Shift]:
-        ws = self._sh.worksheet(SHIFTS_SHEET_TITLE)
-        records = ws.get_all_records()
-        date_str = format_date_dmy(day)
-        shifts: List[Shift] = []
-
-        for row in records:
-            if row.get("Дата") != date_str:
-                continue
-            if str(row.get("Telegram_ID")) != str(telegram_id):
-                continue
-            start = row.get("Время_начала") or ""
-            end = row.get("Время_окончания") or ""
-            dur = row.get("Длительность_мин") or 0
-            try:
-                dur_int = int(dur)
-            except Exception:
-                dur_int = 0
-            shifts.append(
-                Shift(
-                    date_str=date_str,
-                    employee_name=row.get("Сотрудник") or "",
-                    telegram_id=int(row.get("Telegram_ID")),
-                    time_start=start,
-                    time_end=end,
-                    duration_min=dur_int,
-                )
+            ws = self.spreadsheet.add_worksheet(
+                title=self.SHIFTS_SHEET_NAME,
+                rows=1000,
+                cols=len(self.SHIFTS_HEADERS),
             )
 
-        return shifts
+        # Заголовки
+        existing = ws.row_values(1)
+        if existing != self.SHIFTS_HEADERS:
+            ws.resize(rows=1)  # не трогаем кол-во колонок, только строк
+            ws.update("A1", [self.SHIFTS_HEADERS])
 
-    # ------------- Операции ----------
+        logger.info("Google Sheets structure OK")
 
-    def append_operation(
-        self,
-        employee: Employee,
-        op_type: str,
-        date_str: str,
-        article: str,
-        quantity: Optional[int],
-        time_start: datetime,
-        time_end: datetime,
-        extra: str,
-    ) -> None:
-        ws = self._sh.worksheet(OPERATIONS_SHEET_TITLE)
-        start_str = time_start.strftime("%H:%M")
-        end_str = time_end.strftime("%H:%M")
-        duration_min = int((time_end - time_start).total_seconds() // 60)
-        if duration_min < 0:
-            duration_min = 0
+    # -------------------------------------------------------------------------
+    # Работа со сменами
+    # -------------------------------------------------------------------------
+
+    def _now(self) -> datetime:
+        return datetime.now(self.tz)
+
+    def _get_shifts_sheet(self) -> gspread.Worksheet:
+        return self.spreadsheet.worksheet(self.SHIFTS_SHEET_NAME)
+
+    def log_shift_start(self, user_id: int, user_name: str) -> None:
+        """
+        Добавляем строку о начале смены.
+        """
+        ws = self._get_shifts_sheet()
+        now = self._now()
+
+        date_str = now.date().isoformat()
+        time_str = now.strftime("%H:%M:%S")
+
         row = [
             date_str,
-            employee.display_name,
-            employee.telegram_id,
-            op_type,
-            article,
-            quantity if quantity is not None else "",
-            start_str,
-            end_str,
-            duration_min,
-            extra,
+            str(user_id),
+            user_name,
+            time_str,  # Shift Start
+            "",        # Shift End
+            "",        # Total Minutes
+            "",        # Comment
         ]
         ws.append_row(row, value_input_option="USER_ENTERED")
 
-    def get_operations_for_employee_and_date(
-        self, telegram_id: int, day: date
-    ) -> List[Dict[str, Any]]:
-        ws = self._sh.worksheet(OPERATIONS_SHEET_TITLE)
-        records = ws.get_all_records()
-        date_str = format_date_dmy(day)
-        result: List[Dict[str, Any]] = []
-        for row in records:
-            if row.get("Дата") != date_str:
+    def log_shift_end(self, user_id: int) -> None:
+        """
+        Находим последнюю незакрытую смену пользователя и проставляем время конца.
+        """
+        ws = self._get_shifts_sheet()
+        values = ws.get_all_values()
+
+        if len(values) <= 1:
+            # только заголовок, закрывать нечего
+            return
+
+        # Индексы колонок (0-based)
+        COL_USER_ID = 1
+        COL_START = 3
+        COL_END = 4
+        COL_TOTAL_MIN = 5
+
+        now = self._now()
+        date_today = now.date()
+        end_str = now.strftime("%H:%M:%S")
+
+        # ищем снизу вверх
+        target_row_index: Optional[int] = None
+        for idx in range(len(values) - 1, 0, -1):
+            row = values[idx]
+            if len(row) <= COL_USER_ID:
                 continue
-            if str(row.get("Telegram_ID")) != str(telegram_id):
+            if row[COL_USER_ID] != str(user_id):
                 continue
-            result.append(row)
-        return result
 
-    # ------------- Отчёт за день для сотрудника ----------
+            # если уже есть конец смены — пропускаем
+            if len(row) > COL_END and row[COL_END]:
+                continue
 
-    def build_employee_daily_summary(
-        self, telegram_id: int, day: date, now_local: datetime
-    ) -> Dict[str, Any]:
-        date_str = format_date_dmy(day)
-        shifts = self.get_shifts_for_employee_and_date(telegram_id, day)
-        operations = self.get_operations_for_employee_and_date(telegram_id, day)
+            target_row_index = idx + 1  # gspread 1-based
+            start_str = row[COL_START] if len(row) > COL_START else ""
+            break
 
-        # Смены: если есть открытая на сегодня без конца - считаем до now_local
-        total_shift_minutes = 0
-        shift_ranges: List[str] = []
+        if target_row_index is None:
+            # нет незакрытой смены — просто ничего не делаем
+            return
 
-        for shift in shifts:
-            start = shift.time_start
-            end = shift.time_end
-            duration = shift.duration_min
+        # считаем длительность, если есть время начала
+        total_minutes: Optional[int] = None
+        try:
+            if start_str:
+                start_time = datetime.strptime(start_str, "%H:%M:%S").time()
+                start_dt = datetime.combine(date_today, start_time, tzinfo=self.tz)
+                delta: timedelta = now - start_dt
+                total_minutes = int(delta.total_seconds() // 60)
+        except Exception:
+            total_minutes = None
 
-            if not end:
-                # открытая смена - считаем до now_local (но не пишем обратно в таблицу)
-                if start:
-                    start_dt = datetime.combine(
-                        day,
-                        parse_time_hm(start),
-                        tzinfo=now_local.tzinfo,
-                    )
-                    duration = int((now_local - start_dt).total_seconds() // 60)
-                    if duration < 0:
-                        duration = 0
-                    end = "…"
-            total_shift_minutes += duration
-            range_str = f"{start or '?'}–{end or '?'}"
-            shift_ranges.append(range_str)
-
-        # Операции
-        fbs_units = 0
-        fbs_minutes = 0
-        pack_units = 0
-        pack_minutes = 0
-        other_minutes = 0
-
-        for op in operations:
-            op_type = op.get("Тип_операции") or ""
-            qty_raw = op.get("Количество")
-            qty = 0
-            if qty_raw not in (None, ""):
-                try:
-                    qty = int(qty_raw)
-                except Exception:
-                    qty = 0
-            dur_raw = op.get("Длительность_мин") or 0
-            try:
-                dur = int(dur_raw)
-            except Exception:
-                dur = 0
-
-            if op_type == "Сборка FBS":
-                fbs_units += qty
-                fbs_minutes += dur
-            elif op_type == "Упаковка":
-                pack_units += qty
-                pack_minutes += dur
-            elif op_type == "Прочие задачи":
-                other_minutes += dur
-
-        total_ops_minutes = fbs_minutes + pack_minutes + other_minutes
-        residue_minutes = max(total_shift_minutes - total_ops_minutes, 0)
-
-        return {
-            "date_str": date_str,
-            "shift_ranges": shift_ranges,
-            "total_shift_minutes": total_shift_minutes,
-            "fbs_units": fbs_units,
-            "fbs_minutes": fbs_minutes,
-            "pack_units": pack_units,
-            "pack_minutes": pack_minutes,
-            "other_minutes": other_minutes,
-            "total_ops_minutes": total_ops_minutes,
-            "residue_minutes": residue_minutes,
+        updates = {
+            f"E{target_row_index}": end_str,
         }
+        if total_minutes is not None:
+            updates[f"F{target_row_index}"] = str(total_minutes)
 
-    # ------------- Admin summary по дате ----------
+        # пакетное обновление
+        data = [
+            {"range": cell, "values": [[value]]}
+            for cell, value in updates.items()
+        ]
+        ws.batch_update(data, value_input_option="USER_ENTERED")
 
-    def build_admin_summary_for_date(self, day: date) -> Dict[str, Any]:
-        date_str = format_date_dmy(day)
-        shifts_ws = self._sh.worksheet(SHIFTS_SHEET_TITLE)
-        ops_ws = self._sh.worksheet(OPERATIONS_SHEET_TITLE)
+    def get_today_summary(self, user_id: int) -> str:
+        """
+        Возвращает текстовую сводку по всем сменам пользователя за сегодня.
+        """
+        ws = self._get_shifts_sheet()
+        records = ws.get_all_records()  # [{'Date': ..., 'User ID': ..., ...}, ...]
 
-        shift_records = shifts_ws.get_all_records()
-        op_records = ops_ws.get_all_records()
+        today_str = self._now().date().isoformat()
+        user_str = str(user_id)
 
-        # агрегируем по Telegram_ID
-        stats: Dict[str, Dict[str, Any]] = {}
+        user_rows = [
+            r for r in records
+            if str(r.get("User ID", "")) == user_str
+            and str(r.get("Date", "")) == today_str
+        ]
 
-        # Смены
-        for row in shift_records:
-            if row.get("Дата") != date_str:
-                continue
-            tg_id_str = str(row.get("Telegram_ID"))
-            if tg_id_str not in stats:
-                stats[tg_id_str] = {
-                    "employee_name": row.get("Сотрудник") or "",
-                    "telegram_id": tg_id_str,
-                    "shift_minutes": 0,
-                    "shift_count": 0,
-                    "fbs_units": 0,
-                    "fbs_minutes": 0,
-                    "pack_units": 0,
-                    "pack_minutes": 0,
-                    "other_minutes": 0,
-                }
-            dur_raw = row.get("Длительность_мин") or 0
+        if not user_rows:
+            return "За сегодня смен для тебя пока не зафиксировано."
+
+        total_minutes = 0
+        completed_shifts = 0
+
+        lines: List[str] = []
+
+        for r in user_rows:
+            start = r.get("Shift Start") or ""
+            end = r.get("Shift End") or ""
+            minutes_raw = r.get("Total Minutes")
+
             try:
-                dur = int(dur_raw)
+                minutes = int(minutes_raw) if minutes_raw else 0
             except Exception:
-                dur = 0
-            stats[tg_id_str]["shift_minutes"] += dur
-            stats[tg_id_str]["shift_count"] += 1
+                minutes = 0
 
-        # Операции
-        for row in op_records:
-            if row.get("Дата") != date_str:
-                continue
-            tg_id_str = str(row.get("Telegram_ID"))
-            if tg_id_str not in stats:
-                stats[tg_id_str] = {
-                    "employee_name": row.get("Сотрудник") or "",
-                    "telegram_id": tg_id_str,
-                    "shift_minutes": 0,
-                    "shift_count": 0,
-                    "fbs_units": 0,
-                    "fbs_minutes": 0,
-                    "pack_units": 0,
-                    "pack_minutes": 0,
-                    "other_minutes": 0,
-                }
+            if end:
+                completed_shifts += 1
+                total_minutes += minutes
 
-            op_type = row.get("Тип_операции") or ""
-            qty_raw = row.get("Количество")
-            qty = 0
-            if qty_raw not in (None, ""):
-                try:
-                    qty = int(qty_raw)
-                except Exception:
-                    qty = 0
-            dur_raw = row.get("Длительность_мин") or 0
-            try:
-                dur = int(dur_raw)
-            except Exception:
-                dur = 0
+            lines.append(f"- {start or '—'} → {end or '—'} ({minutes} мин)")
 
-            if op_type == "Сборка FBS":
-                stats[tg_id_str]["fbs_units"] += qty
-                stats[tg_id_str]["fbs_minutes"] += dur
-            elif op_type == "Упаковка":
-                stats[tg_id_str]["pack_units"] += qty
-                stats[tg_id_str]["pack_minutes"] += dur
-            elif op_type == "Прочие задачи":
-                stats[tg_id_str]["other_minutes"] += dur
+        hours = total_minutes // 60
+        minutes_rem = total_minutes % 60
 
-        return {
-            "date_str": date_str,
-            "employees": list(stats.values()),
-        }
+        summary_header = (
+            f"Сегодняшние смены:\n"
+            f"Всего смен: {len(user_rows)} (закрытых: {completed_shifts})\n"
+            f"Общее время: {hours} ч {minutes_rem} мин\n"
+        )
+
+        return summary_header + "\n".join(lines)
 
 
-def init_sheets_client(config) -> SheetsClient:
-    global sheets_client
-    sheets_client = SheetsClient(
-        sheet_id=config.google_sheet_id,
-        service_account_info=config.google_service_account_info,
-        timezone=config.timezone,
-    )
-    return sheets_client
+# -------------------------------------------------------------------------
+# Функции, которые вызываются из main.py / хендлеров
+# -------------------------------------------------------------------------
+
+
+def ensure_sheets_structure(app_config) -> None:
+    """
+    Создаём глобальный клиент и убеждаемся, что структура таблицы готова.
+    Вызывается при старте приложения.
+    """
+    global _sheets_client
+    logger.info("Ensuring Google Sheets structure...")
+
+    if _sheets_client is None:
+        _sheets_client = SheetsClient.from_app_config(app_config)
+
+    _sheets_client.ensure_structure()
+
+    logger.info("Google Sheets structure OK")
+
+
+def get_sheets_client() -> Optional[SheetsClient]:
+    """
+    Возвращаем уже инициализированный глобальный клиент.
+    Может вернуть None, если ensure_sheets_structure ещё не вызывался.
+    """
+    return _sheets_client
