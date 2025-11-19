@@ -5,10 +5,10 @@ from __future__ import annotations
 from aiogram import Router, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, ReplyKeyboardRemove
+from aiogram.types import Message
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
-from .. import sheets  # важный момент: импортируем именно модуль, а не переменную
+from .. import sheets  # важно: импортируем модуль, а не переменную
 
 
 router = Router(name="warehouse_bot")
@@ -47,7 +47,7 @@ def _main_menu_kb():
 async def cmd_start(message: Message, state: FSMContext) -> None:
     """
     Приветствие + вывод главного меню.
-    Здесь была ошибка с assert sheets_client is not None.
+    Раньше тут падало на assert sheets_client is not None.
     Теперь клиент берётся аккуратно через _get_sheets_client().
     """
     client = _get_sheets_client()
@@ -96,14 +96,10 @@ async def start_shift(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     full_name = message.from_user.full_name
 
-    # Здесь вызываем метод клиента, который должен создать/отметить начало смены.
-    # Название метода подгоняй под то, как он у тебя реализован в SheetsClient.
     try:
-        # пример: client.log_shift_start(user_id=user_id, user_name=full_name)
+        # TODO: приведи к фактическому имени метода в SheetsClient
         client.log_shift_start(user_id=user_id, user_name=full_name)
     except AttributeError:
-        # Если у твоего клиента другой интерфейс — будет понятная ошибка в логах,
-        # а пользователю — мягкое сообщение.
         await message.answer(
             "Не получилось зафиксировать начало смены — бот пока не настроен до конца. "
             "Сообщи, пожалуйста, руководителю."
@@ -130,7 +126,7 @@ async def stop_shift(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
 
     try:
-        # пример: client.log_shift_end(user_id=user_id)
+        # TODO: приведи к фактическому имени метода
         client.log_shift_end(user_id=user_id)
     except AttributeError:
         await message.answer(
@@ -150,13 +146,12 @@ async def stop_shift(message: Message, state: FSMContext) -> None:
 async def add_operation_entry(message: Message, state: FSMContext) -> None:
     """
     Заготовка хендлера для добавления записи по операции (сборка/упаковка и т.п.).
-    Здесь можно будет сделать FSM-диалог: что делал, артикул, количество, время и т.д.
-    Пока просто заглушка, чтобы бот не падал.
+    Здесь позже можно сделать FSM-диалог. Пока заглушка.
     """
     await message.answer(
         "Добавление операций пока не настроено до конца 🛠\n\n"
         "Но бот уже умеет фиксировать начало и конец смены. "
-        "Когда донастроим операции — сюда появится простой диалог для ввода данных.",
+        "Когда донастроим операции — здесь появится простой диалог для ввода данных.",
         reply_markup=_main_menu_kb(),
     )
 
@@ -174,7 +169,7 @@ async def today_summary(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
 
     try:
-        # пример: summary = client.get_today_summary(user_id=user_id)
+        # TODO: приведи к фактическому имени метода
         summary = client.get_today_summary(user_id=user_id)
     except AttributeError:
         await message.answer(
@@ -204,8 +199,9 @@ async def fallback(message: Message) -> None:
 # --- Регистрация в диспетчере ------------------------------------------------
 
 
-def register_handlers(dp) -> None:
+def register_handlers(dp, config) -> None:
     """
-    Вызывается из main.py: from .bot import register_handlers; register_handlers(dp)
+    Вызывается из main.py: register_handlers(dp, config)
+    config сейчас не используем, но принимаем, чтобы не было TypeError.
     """
     dp.include_router(router)
