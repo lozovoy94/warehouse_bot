@@ -38,19 +38,18 @@ def build_webhook_url(config) -> str:
 
 
 def create_web_app(config) -> web.Application:
-    # ✅ Исправление под aiogram 3.7:
-    # parse_mode задаём через DefaultBotProperties
+    # aiogram 3.7+: parse_mode задаём через DefaultBotProperties
     bot = Bot(
         token=config.telegram_bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
 
-    # Инициализация Google Sheets (если не получится — просто залогируется ошибка)
+    # Инициализация Google Sheets
     init_sheets_client(config)
 
-    # Регистрируем хэндлеры
-    register_handlers(dp)
+    # ✅ Передаём config, т.к. register_handlers ожидает (dp, config)
+    register_handlers(dp, config)
 
     app = web.Application()
 
@@ -62,7 +61,6 @@ def create_web_app(config) -> web.Application:
 
     setup_application(app, dp, bot=bot)
 
-    # Чтобы потом было удобно достать из app, если понадобится
     app["bot"] = bot
     app["config"] = config
 
@@ -73,9 +71,6 @@ def main():
     config = load_config()
 
     app = create_web_app(config)
-
-    # Webhook в Telegram уже должен быть установлен (он сохраняется между рестартами).
-    # Если захочешь, можем отдельно вернуть установку вебхука при старте.
 
     web.run_app(app, host="0.0.0.0", port=8080)
 
