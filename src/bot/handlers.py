@@ -1,68 +1,53 @@
-# src/bot/handlers.py
-
 from __future__ import annotations
 
-from aiogram import Router, F
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
+import logging
+
+from aiogram import Dispatcher, F, Router
+from aiogram.filters import CommandStart
 from aiogram.types import Message
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
-from .. import sheets  # важно: импортируем модуль, а не переменную
+from src.config import AppConfig
+from src.sheets import get_sheets_client
+from .keyboards import main_menu_keyboard
+
+logger = logging.getLogger(__name__)
+
+router = Router()
 
 
-router = Router(name="warehouse_bot")
-
-
-# --- Вспомогательные функции -------------------------------------------------
-
-
-def _get_sheets_client():
+def register_handlers(dp: Dispatcher, config: AppConfig) -> None:
     """
-    Единая точка доступа к Google Sheets клиенту.
-    Если по какой-то причине он не инициализирован — вернём None,
-    а хендлер сам решит, что ответить пользователю.
+    Регистрируем все хендлеры на переданный Dispatcher.
+    Конфиг пока не используем внутри, но оставляем параметр
+    на будущее (вдруг понадобится текст/фича от окружения).
     """
-    try:
-        return sheets.get_sheets_client()
-    except Exception:
-        # сюда попадём, если глобальный клиент не успел инициализироваться
-        return None
+    dp.include_router(router)
 
 
-def _main_menu_kb():
-    kb = ReplyKeyboardBuilder()
-    kb.button(text="🟢 Начать смену")
-    kb.button(text="🔴 Завершить смену")
-    kb.button(text="➕ Добавить операцию")
-    kb.button(text="📊 Итог за сегодня")
-    kb.adjust(2, 2)
-    return kb.as_markup(resize_keyboard=True)
+# -------- общие утилиты --------
 
 
-# --- Хендлеры ----------------------------------------------------------------
+def _require_sheets():
+    sc = get_sheets_client()
+    if sc is None:
+        # Если вдруг что-то пошло не так при старте — сразу говорим об этом.
+        raise RuntimeError("Sheets client is not initialized")
+    return sc
+
+
+def _user_info(message: Message) -> tuple[int, str, str | None]:
+    user = message.from_user
+    user_id = user.id
+    full_name = (user.full_name or "").strip() or "Без имени"
+    username = user.username
+    return user_id, full_name, username
+
+
+# -------- команды --------
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
-    """
-    Приветствие + вывод главного меню.
-    Раньше тут падало на assert sheets_client is not None.
-    Теперь клиент берётся аккуратно через _get_sheets_client().
-    """
-    client = _get_sheets_client()
-    if client is None:
-        await message.answer(
-            "Привет! 👋\n\n"
-            "Не получается подключиться к Google Sheets. "
-            "Попробуй ещё раз через пару минут. Если ошибка повторяется — напиши руководителю, "
-            "что «бот не может подключиться к таблице»."
-        )
-        return
-
-    # Сбрасываем возможное старое состояние
-    await state.clear()
-
+async def cmd_start(message: Message) -> None:
     await message.answer(
         "Привет! Я бот для учёта работы на складе.\n\n"
         "Через меня ты можешь:\n"
@@ -70,138 +55,142 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "• фиксировать, что именно делал и сколько\n"
         "• смотреть краткий итог за сегодня\n\n"
         "Выбери действие с клавиатуры ниже 👇",
-        reply_markup=_main_menu_kb(),
+        reply_markup=main_menu_keyboard(),
     )
 
 
-@router.message(Command("menu"))
-async def cmd_menu(message: Message, state: FSMContext) -> None:
-    """
-    Принудительное возвращение в главное меню.
-    """
-    await state.clear()
-    await message.answer("Главное меню 👇", reply_markup=_main_menu_kb())
-
-
 @router.message(F.text == "🟢 Начать смену")
-async def start_shift(message: Message, state: FSMContext) -> None:
-    client = _get_sheets_client()
-    if client is None:
-        await message.answer(
-            "Не удалось подключиться к таблице Google Sheets. "
-            "Смена не зафиксирована. Попробуй ещё раз позже."
-        )
-        return
-
-    user_id = message.from_user.id
-    full_name = message.from_user.full_name
+async def handle_start_shift(message: Message) -> None:
+    sc = _require_sheets()
+    user_id, full_name, username = _user_info(message)
 
     try:
-        # TODO: приведи к фактическому имени метода в SheetsClient
-        client.log_shift_start(user_id=user_id, user_name=full_name)
-    except AttributeError:
+        ok, text = sc.start_shift(user_id=user_id, full_name=full_name, username=username)
+    except Exception:
+        logger.exception("Failed to start shift for user %s", user_id)
         await message.answer(
             "Не получилось зафиксировать начало смены — бот пока не настроен до конца. "
             "Сообщи, пожалуйста, руководителю."
         )
         return
 
-    await message.answer(
-        "Смена запущена ✅\n\n"
-        "Когда закончишь работу — нажми «🔴 Завершить смену».",
-        reply_markup=_main_menu_kb(),
-    )
+    await message.answer(text)
 
 
 @router.message(F.text == "🔴 Завершить смену")
-async def stop_shift(message: Message, state: FSMContext) -> None:
-    client = _get_sheets_client()
-    if client is None:
-        await message.answer(
-            "Не удалось подключиться к таблице Google Sheets. "
-            "Конец смены не зафиксирован. Попробуй ещё раз позже."
-        )
-        return
-
-    user_id = message.from_user.id
+async def handle_end_shift(message: Message) -> None:
+    sc = _require_sheets()
+    user_id, full_name, username = _user_info(message)  # full_name/username пока не нужны
 
     try:
-        # TODO: приведи к фактическому имени метода
-        client.log_shift_end(user_id=user_id)
-    except AttributeError:
+        ok, text = sc.end_shift(user_id=user_id)
+    except Exception:
+        logger.exception("Failed to end shift for user %s", user_id)
         await message.answer(
-            "Не получилось зафиксировать конец смены — бот пока не настроен до конца. "
+            "Не получилось завершить смену — бот пока не настроен до конца. "
             "Сообщи, пожалуйста, руководителю."
         )
         return
 
-    await message.answer(
-        "Смена завершена ✅\n\n"
-        "Спасибо за работу! Если нужно что-то дописать — можно запустить новую смену.",
-        reply_markup=_main_menu_kb(),
-    )
+    await message.answer(text)
 
 
 @router.message(F.text == "➕ Добавить операцию")
-async def add_operation_entry(message: Message, state: FSMContext) -> None:
+async def handle_add_operation(message: Message) -> None:
     """
-    Заготовка хендлера для добавления записи по операции (сборка/упаковка и т.п.).
-    Здесь позже можно сделать FSM-диалог. Пока заглушка.
+    Для простоты пока делаем максимально лёгкий вариант:
+    сотрудник присылает в ответ одно сообщение вида:
+
+    вид_операции; артикул; количество; минуты; комментарий
+
+    Пример:
+    FBS-сборка; 123-ABC; 5; 20; собирал заказ WB123
+
+    Всё, что не сможет распарситься, улетит в комментарий.
+    На будущее тут можно будет прикрутить полноценную FSM.
     """
     await message.answer(
-        "Добавление операций пока не настроено до конца 🛠\n\n"
-        "Но бот уже умеет фиксировать начало и конец смены. "
-        "Когда донастроим операции — здесь появится простой диалог для ввода данных.",
-        reply_markup=_main_menu_kb(),
+        "Пришли одним сообщением данные об операции в формате:\n\n"
+        "<вид_операции>; <артикул>; <количество>; <минуты>; <комментарий>\n\n"
+        "Пример:\n"
+        "FBS-сборка; 123-ABC; 5; 20; собирал заказ WB123",
     )
+
+
+@router.message(
+    F.text
+    & ~F.text.in_({"🟢 Начать смену", "🔴 Завершить смену", "➕ Добавить операцию", "📊 Итог за сегодня"})
+)
+async def handle_operation_freeform(message: Message) -> None:
+    """
+    Сюда попадает текст после нажатия «Добавить операцию».
+    Никакого состояния не ведём — если формат похож на нужный, пишем как операцию.
+    Если нет — всё равно пишем, но многое попадёт в комментарий.
+    """
+    text = message.text or ""
+    parts = [p.strip() for p in text.split(";")]
+
+    op_type = parts[0] if len(parts) >= 1 and parts[0] else "Операция"
+    sku = parts[1] if len(parts) >= 2 and parts[1] else None
+
+    def _to_int(s: str | None) -> int | None:
+        if not s:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            return None
+
+    qty = _to_int(parts[2] if len(parts) >= 3 else None)
+    minutes_spent = _to_int(parts[3] if len(parts) >= 4 else None)
+
+    comment_parts = []
+    if len(parts) >= 5:
+        comment_parts.append("; ".join(parts[4:]))
+    # если не удалось распарсить количество/минуты — добавим в комментарий
+    if qty is None and len(parts) >= 3:
+        comment_parts.append(f"Не удалось распознать количество из «{parts[2]}»")
+    if minutes_spent is None and len(parts) >= 4:
+        comment_parts.append(f"Не удалось распознать минуты из «{parts[3]}»")
+
+    comment = " | ".join(comment_parts) if comment_parts else None
+
+    sc = _require_sheets()
+    user_id, full_name, username = _user_info(message)
+
+    try:
+        ok, resp_text = sc.add_operation(
+            user_id=user_id,
+            full_name=full_name,
+            username=username,
+            operation_type=op_type,
+            sku=sku,
+            qty=qty,
+            minutes_spent=minutes_spent,
+            comment=comment,
+        )
+    except Exception:
+        logger.exception("Failed to add operation for user %s", user_id)
+        await message.answer(
+            "Не получилось сохранить операцию — сообщи, пожалуйста, руководителю."
+        )
+        return
+
+    await message.answer(resp_text, reply_markup=main_menu_keyboard())
 
 
 @router.message(F.text == "📊 Итог за сегодня")
-async def today_summary(message: Message, state: FSMContext) -> None:
-    client = _get_sheets_client()
-    if client is None:
-        await message.answer(
-            "Не получилось подключиться к таблице Google Sheets. "
-            "Сводка за сегодня недоступна. Попробуй позже."
-        )
-        return
-
-    user_id = message.from_user.id
+async def handle_today_summary(message: Message) -> None:
+    sc = _require_sheets()
+    user_id, full_name, username = _user_info(message)
 
     try:
-        # TODO: приведи к фактическому имени метода
-        summary = client.get_today_summary(user_id=user_id)
-    except AttributeError:
+        text = sc.get_today_summary(user_id=user_id)
+    except Exception:
+        logger.exception("Failed to build summary for user %s", user_id)
         await message.answer(
-            "Сводка за сегодня пока не настроена 🛠\n"
-            "Основной функционал — учёт смен — уже работает."
+            "Не получилось собрать итог за сегодня — сообщи, пожалуйста, руководителю."
         )
         return
 
-    await message.answer(
-        f"Твоя сводка за сегодня:\n\n{summary}",
-        reply_markup=_main_menu_kb(),
-    )
-
-
-@router.message()
-async def fallback(message: Message) -> None:
-    """
-    Общий хендлер на всё остальное — чтобы не было ощущения «бот молчит».
-    """
-    await message.answer(
-        "Пока я понимаю только команды с кнопок 👇\n\n"
-        "Если что-то не работает — начни с /start.",
-        reply_markup=_main_menu_kb(),
-    )
-
-
-# --- Регистрация в диспетчере ------------------------------------------------
-
-
-def register_handlers(dp, config) -> None:
-    """
-    Вызывается из main.py: register_handlers(dp, config)
-    config сейчас не используем, но принимаем, чтобы не было TypeError.
-    """
-    dp.include_router(router)
+    await message.answer(text)
